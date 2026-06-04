@@ -1,0 +1,12 @@
+[
+  {
+    "emoji": "🧬",
+    "name": "Example Project Alpha",
+    "page_id": "REPLACE_WITH_YOUR_NOTION_PAGE_ID"
+  },
+  {
+    "emoji": "🧠",
+    "name": "Example Project Beta",
+    "page_id": "REPLACE_WITH_YOUR_NOTION_PAGE_ID"
+  }
+]

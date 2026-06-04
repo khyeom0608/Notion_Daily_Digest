@@ -1,0 +1,27 @@
+# 비밀
+.env
+.env.bak
+
+# 실제 운영 데이터 (example만 커밋)
+projects.json
+notion_digest_state.json
+
+# 사용자별 launchd plist (example만 커밋)
+com.*.notion-digest.plist
+!com.example.notion-digest.plist
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
+.Rhistory
+
+# Logs
+*.log
