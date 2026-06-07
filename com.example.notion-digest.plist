@@ -5,7 +5,7 @@
     <key>Label</key>
     <string>com.example.notion-digest</string>
 
-    <!-- 본인 경로로 수정 -->
+    <!-- Replace with your own absolute path -->
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOUR_USERNAME/Notion_Daily_Digest/run_notion_digest.sh</string>
@@ -14,7 +14,7 @@
     <key>WorkingDirectory</key>
     <string>/Users/YOUR_USERNAME/Notion_Daily_Digest</string>
 
-    <!-- 매일 09:00 (시스템 timezone 기준) -->
+    <!-- Runs every day at 09:00 in the system's local time zone -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -31,6 +31,7 @@
     <key>StandardErrorPath</key>
     <string>/Users/YOUR_USERNAME/Library/Logs/notion-digest/launchd-stderr.log</string>
 
+    <!-- PATH must include python3; LANG ensures UTF-8 output -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

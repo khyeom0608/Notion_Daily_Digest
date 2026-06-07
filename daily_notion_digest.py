@@ -1,13 +1,26 @@
 """
-매일 아침 9시(KST)에 실행되어
-연구실 프로젝트들의 '참고 논문 및 아이디어' 페이지에서 최근 추가/수정된
-자식 페이지(논문/아이디어 정리)를 수집하고,
-Gemini로 친근한 요약을 만들어 Slack #test_claude 채널에 보낸다.
+Notion Daily Digest
 
-사용법:
-    python3 daily_notion_digest.py             # 정상 실행 (Slack 전송)
-    python3 daily_notion_digest.py --dry-run   # Slack 전송 없이 콘솔 출력만
-    python3 daily_notion_digest.py --hours 48  # 룩백 윈도우 변경 (기본 24h)
+Collects recent additions/edits under each parent page listed in projects.json
+(those parents typically being a "Reference Papers & Ideas" page under each
+project), summarizes them per-project with Google Gemini, and posts a single
+digest message to a Slack channel via Incoming Webhook.
+
+Intended to run once a day, typically at 09:00 local time, scheduled via
+macOS launchd.
+
+Usage:
+    python3 daily_notion_digest.py                 # real run (post to Slack)
+    python3 daily_notion_digest.py --dry-run       # console only, no Slack
+    python3 daily_notion_digest.py --no-llm        # skip LLM summary, page list only
+    python3 daily_notion_digest.py --hours 48      # force a fixed lookback window
+
+Note on language: SYSTEM_INSTRUCTION, the LLM prompt template, the fallback
+summary line, and the Slack header/notification text are in Korean by default
+because this codebase originated in a Korean-speaking lab. To switch the
+output language, edit SYSTEM_INSTRUCTION, the prompt in llm_summarize(), the
+header/sub strings in build_slack_blocks(), and the notification text in
+post_to_slack().
 """
 
 from __future__ import annotations
@@ -37,9 +50,12 @@ DEFAULT_LOOKBACK_HOURS = 24
 
 
 def load_projects() -> list[tuple[str, str, str]]:
-    """projects.json에서 (emoji, name, page_id) 튜플 리스트 로드."""
+    """Load (emoji, name, page_id) tuples from projects.json."""
     if not PROJECTS_FILE.exists():
-        sys.exit(f"{PROJECTS_FILE.name}이 없습니다. projects.json.example을 참고해 만드세요.")
+        sys.exit(
+            f"{PROJECTS_FILE.name} not found. "
+            f"Copy projects.json.example to projects.json and fill in your page IDs."
+        )
     data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
     return [(p["emoji"], p["name"], p["page_id"]) for p in data]
 
@@ -58,7 +74,7 @@ def notion_headers(token: str) -> dict:
 
 
 def list_child_pages(parent_id: str, h: dict) -> list[dict]:
-    """부모 페이지의 직계 child_page 블록만 페이지네이션으로 모두 가져온다."""
+    """Paginate through all direct child_page blocks of a parent page."""
     out: list[dict] = []
     url = f"{NOTION_API}/blocks/{parent_id}/children?page_size=100"
     while True:
@@ -91,7 +107,7 @@ def get_user_name(user_id: str, h: dict, cache: dict) -> str:
 
 
 def page_text_preview(page_id: str, h: dict, max_chars: int = 800) -> str:
-    """페이지 본문 일부를 텍스트로 추출 (LLM 컨텍스트용)."""
+    """Extract a plain-text preview of a page's body for the LLM prompt."""
     r = requests.get(
         f"{NOTION_API}/blocks/{page_id}/children?page_size=20",
         headers=h, timeout=30,
@@ -111,16 +127,17 @@ def page_text_preview(page_id: str, h: dict, max_chars: int = 800) -> str:
             rich = b.get("code", {}).get("rich_text", [])
             parts.append("[code] " + "".join(x.get("plain_text", "") for x in rich)[:200])
         elif t == "child_page":
+            # Korean label kept intentionally — feeds the Korean LLM prompt.
             parts.append(f"  · 하위 페이지: {b.get('child_page', {}).get('title', '')}")
         if sum(len(p) for p in parts) > max_chars:
             break
     return "\n".join(parts)[:max_chars]
 
 
-# ---------- 수집 ----------
+# ---------- Collection ----------
 
 def collect_updates(cutoff: datetime, h: dict) -> dict[str, list[dict]]:
-    """프로젝트별로 cutoff 이후 수정된 자식 페이지 목록을 모은다."""
+    """For each project, gather child pages whose last_edited_time >= cutoff."""
     user_cache: dict[str, str] = {}
     by_project: dict[str, list[dict]] = {}
 
@@ -140,6 +157,8 @@ def collect_updates(cutoff: datetime, h: dict) -> dict[str, list[dict]]:
             if meta is None:
                 continue
 
+            # Title fallback string kept in Korean — it can be embedded into
+            # the LLM prompt downstream.
             title = c.get("child_page", {}).get("title", "(제목 없음)")
             created = meta.get("created_time", "")
             created_dt = datetime.fromisoformat(created.replace("Z", "+00:00")) if created else None
@@ -172,7 +191,7 @@ def collect_updates(cutoff: datetime, h: dict) -> dict[str, list[dict]]:
 
 def _gemini_call_with_retry(client: genai.Client, prompt: str,
                             cfg: "genai_types.GenerateContentConfig") -> str:
-    """503/429 일시 오류는 백오프하며 최대 4회 재시도. 그래도 실패하면 빈 문자열."""
+    """Retry transient 503/429 errors with exponential backoff (4 attempts max)."""
     delays = [10, 30, 60, 120]
     for attempt, delay in enumerate(delays, start=1):
         try:
@@ -182,13 +201,15 @@ def _gemini_call_with_retry(client: genai.Client, prompt: str,
             msg = str(e)
             transient = any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
             if attempt == len(delays) or not transient:
-                print(f"  Gemini 호출 실패 (시도 {attempt}/{len(delays)}): {msg[:160]}")
+                print(f"  Gemini call failed (attempt {attempt}/{len(delays)}): {msg[:160]}")
                 return ""
-            print(f"  Gemini 일시 오류 (시도 {attempt}), {delay}s 대기 후 재시도")
+            print(f"  Gemini transient error (attempt {attempt}), retrying after {delay}s")
             time.sleep(delay)
     return ""
 
 
+# Korean — controls the LLM output language and tone.
+# Edit this (and the prompt template in llm_summarize) to switch languages.
 SYSTEM_INSTRUCTION = """\
 너는 우리 연구실의 각 프로젝트 노션 페이지에 있는 '참고 논문 및 아이디어'에
 매일 추가·수정되는 내용을 정리해서 학생들에게 알려주는 비서야.
@@ -214,7 +235,10 @@ SYSTEM_INSTRUCTION = """\
 
 
 def llm_summarize(updates: dict[str, list[dict]], client: genai.Client) -> dict[str, str]:
-    """프로젝트별로 한 단락 친근한 요약을 만든다 (Gemini)."""
+    """Produce one friendly per-project summary paragraph via Gemini.
+
+    Prompt template is Korean by default — controls the output language.
+    """
     summaries: dict[str, str] = {}
     cfg = genai_types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
@@ -223,7 +247,8 @@ def llm_summarize(updates: dict[str, list[dict]], client: genai.Client) -> dict[
     )
     for idx, (project, items) in enumerate(updates.items()):
         if idx > 0:
-            # 무료 tier RPM/TPM 여유 확보용 — 호출 사이 15초 간격 (분당 4회 미만)
+            # Pace calls to stay well under free-tier RPM/TPM.
+            # 15 s between calls = under 4 calls per minute.
             time.sleep(15)
         bullet_lines = []
         for it in items:
@@ -240,6 +265,7 @@ def llm_summarize(updates: dict[str, list[dict]], client: genai.Client) -> dict[
             "위 지침대로 정리해줘."
         )
         text = _gemini_call_with_retry(client, prompt, cfg)
+        # Fallback line shown when LLM returns nothing (e.g. RPD exhausted).
         summaries[project] = text or "_(요약 생성 실패 — 아래 페이지 목록을 직접 확인해주세요)_"
     return summaries
 
@@ -250,6 +276,7 @@ def build_slack_blocks(updates: dict[str, list[dict]],
                        summaries: dict[str, str],
                        window_start: datetime,
                        window_end: datetime) -> list[dict]:
+    """Build the Slack Block Kit payload. Header/sub text is Korean by default."""
     total = sum(len(v) for v in updates.values())
     header = (
         f"📚 오늘의 참고 논문 & 아이디어 업데이트 "
@@ -277,7 +304,7 @@ def build_slack_blocks(updates: dict[str, list[dict]],
             link_title = it["title"].replace("|", "│")[:140]
             body_lines.append(f"  {tag} <{it['url']}|{link_title}> · _{who}_")
         text = "\n".join(body_lines)
-        # Slack section text 한도 3000자
+        # Slack section text limit is 3000 chars; keep a small margin.
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}})
         blocks.append({"type": "divider"})
 
@@ -285,13 +312,14 @@ def build_slack_blocks(updates: dict[str, list[dict]],
 
 
 def post_to_slack(webhook_url: str, blocks: list[dict]) -> None:
+    # Korean fallback "text" is what shows up in mobile notification previews.
     payload = {"blocks": blocks, "text": "오늘의 참고 논문 & 아이디어 업데이트"}
     r = requests.post(webhook_url, json=payload, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"Slack webhook 실패 {r.status_code}: {r.text[:300]}")
+        raise RuntimeError(f"Slack webhook failed {r.status_code}: {r.text[:300]}")
 
 
-# ---------- 상태 ----------
+# ---------- State ----------
 
 def load_last_run() -> Optional[datetime]:
     if not STATE_FILE.exists():
@@ -311,9 +339,14 @@ def save_last_run(when: datetime) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="Slack에 전송하지 않고 콘솔에만 출력")
-    ap.add_argument("--hours", type=int, default=None, help=f"룩백 윈도우 (기본: state 파일, 없으면 {DEFAULT_LOOKBACK_HOURS}h)")
-    ap.add_argument("--no-llm", action="store_true", help="LLM 요약 생략 (페이지 목록만). --dry-run 같이 주면 Slack 전송도 안 함")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Skip Slack and print to the console instead.")
+    ap.add_argument("--hours", type=int, default=None,
+                    help=f"Override the lookback window in hours "
+                         f"(default: state file, or {DEFAULT_LOOKBACK_HOURS}h if no state).")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="Skip LLM summary; still post the page list. "
+                         "Combine with --dry-run to skip Slack too.")
     args = ap.parse_args()
 
     load_dotenv(Path(__file__).parent / ".env")
@@ -321,7 +354,7 @@ def main() -> int:
     gemini_key = os.environ.get("GEMINI_API_KEY")
     webhook = os.environ.get("SLACK_WEBHOOK_URL")
     if not notion_token or not gemini_key or not webhook:
-        sys.exit(".env에 NOTION_API_KEY / GEMINI_API_KEY / SLACK_WEBHOOK_URL 모두 필요합니다.")
+        sys.exit("Missing required env vars in .env: NOTION_API_KEY / GEMINI_API_KEY / SLACK_WEBHOOK_URL")
 
     now = datetime.now(timezone.utc)
     if args.hours is not None:
@@ -336,10 +369,10 @@ def main() -> int:
     t0 = time.time()
     updates = collect_updates(cutoff, h)
     n = sum(len(v) for v in updates.values())
-    print(f"수집 완료: {n}건 / {len(updates)}개 프로젝트 ({time.time()-t0:.1f}s)")
+    print(f"Collected: {n} pages across {len(updates)} projects ({time.time()-t0:.1f}s)")
 
     if n == 0:
-        print("새 업데이트 없음 — Slack 전송 생략")
+        print("No new updates — skipping Slack")
         if not args.dry_run:
             save_last_run(now)
         return 0
@@ -347,16 +380,16 @@ def main() -> int:
     if args.no_llm:
         summaries = {p: "" for p in updates}
     else:
-        print("LLM 요약 생성 중...")
+        print("Generating LLM summaries...")
         client = genai.Client(api_key=gemini_key)
         summaries = llm_summarize(updates, client)
 
     blocks = build_slack_blocks(updates, summaries, cutoff, now)
 
     if args.dry_run:
-        print("\n=== DRY RUN — Slack에 전송 안 함 ===\n")
+        print("\n=== DRY RUN — not posting to Slack ===\n")
         for project, items in updates.items():
-            print(f"\n## {project}  ({len(items)}건)")
+            print(f"\n## {project}  ({len(items)} pages)")
             summary = summaries.get(project, "").strip()
             if summary:
                 print(summary)
@@ -366,10 +399,10 @@ def main() -> int:
                 print(f"     {it['url']}")
         return 0
 
-    print(f"Slack 전송 중... (블록 {len(blocks)}개)")
+    print(f"Posting to Slack ({len(blocks)} blocks)...")
     post_to_slack(webhook, blocks)
     save_last_run(now)
-    print("완료.")
+    print("Done.")
     return 0
 
 

@@ -1,12 +1,12 @@
-# 비밀
+# Secrets
 .env
 .env.bak
 
-# 실제 운영 데이터 (example만 커밋)
+# Per-deployment real data (only the .example files are committed)
 projects.json
 notion_digest_state.json
 
-# 사용자별 launchd plist (example만 커밋)
+# User-specific launchd plist (only the example template is committed)
 com.*.notion-digest.plist
 !com.example.notion-digest.plist
 
@@ -18,7 +18,7 @@ __pycache__/
 # macOS
 .DS_Store
 
-# Editor/IDE
+# Editor / IDE
 .vscode/
 .idea/
 .Rhistory

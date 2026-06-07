@@ -1,8 +1,8 @@
 #!/bin/bash
-# launchd가 호출하는 wrapper.
-# - 작업 디렉토리를 .py 위치로 고정
-# - stdout/stderr를 일자별 로그로 저장
-# - 종료 코드 그대로 반환
+# Wrapper invoked by launchd.
+# - cd into the script's directory so relative paths work
+# - append both stdout and stderr to a per-day log file
+# - propagate the python exit code
 
 set -u
 
@@ -13,9 +13,9 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/digest-$(date +%Y-%m-%d).log"
 
 {
-  echo "===== $(date '+%Y-%m-%d %H:%M:%S %Z') 실행 시작 ====="
+  echo "===== $(date '+%Y-%m-%d %H:%M:%S %Z') run start ====="
   /usr/bin/python3 daily_notion_digest.py
   RC=$?
-  echo "===== 종료 코드: $RC ====="
+  echo "===== exit code: $RC ====="
   exit $RC
 } >> "$LOG" 2>&1
